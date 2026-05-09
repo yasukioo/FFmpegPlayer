@@ -1,0 +1,76 @@
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(QT_QML_OUTPUT_DIRECTORY  ${CMAKE_BINARY_DIR})
+
+find_package(Qt6 COMPONENTS Quick REQUIRED)
+include(GNUInstallDirs)
+
+qt_add_library(${PROJECT_NAME} SHARED)
+qt_add_qml_module(${PROJECT_NAME}
+    OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PROJECT_NAME}
+    URI FFmpegPlayer
+    VERSION 1.0
+    SOURCES        
+		FFmpegPlayer.h
+        FFmpegPlayer.cpp
+        FFmpegViewItem.h
+        FFmpegViewItem.cpp
+)
+
+set_target_properties(${PROJECT_NAME} PROPERTIES
+    MACOSX_BUNDLE_GUI_IDENTIFIER com.yasukioo.FFmpegPlayer
+    MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
+    MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}
+    MACOSX_BUNDLE TRUE
+    WIN32_EXECUTABLE TRUE
+)
+
+target_compile_definitions(${PROJECT_NAME}
+    PRIVATE $<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:QT_QML_DEBUG>
+    CORE_LIBRARY
+)
+
+set(FFMPEG_INCLUDE_DIR "C:/ffmpeg/include")
+set(FFMPEG_LIB_DIR "C:/ffmpeg/lib")
+set(FFMPEG_BIN_DIR "C:/ffmpeg/bin")
+target_include_directories(${PROJECT_NAME} PRIVATE ${FFMPEG_INCLUDE_DIR})
+target_link_directories(${PROJECT_NAME} PRIVATE ${FFMPEG_LIB_DIR})
+
+target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Quick)
+target_link_libraries(${PROJECT_NAME} PRIVATE 
+    avcodec
+    avformat
+    avutil
+    swscale
+    avdevice
+)
+
+target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+install(TARGETS ${PROJECT_NAME}
+    BUNDLE DESTINATION .
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(TARGETS ${PROJECT_NAME}plugin
+    BUNDLE DESTINATION .
+    LIBRARY DESTINATION "${CMAKE_INSTALL_BINDIR}/qml/${PROJECT_NAME}"
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}/qml/${PROJECT_NAME}"
+)
+
+install(FILES
+    "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PROJECT_NAME}/qmldir"
+    "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PROJECT_NAME}/${PROJECT_NAME}.qmltypes"
+    DESTINATION "${CMAKE_INSTALL_BINDIR}/qml/${PROJECT_NAME}"
+)
+
+if(EXISTS "${FFMPEG_BIN_DIR}")
+    file(GLOB FFMPEG_RUNTIME_DLLS "${FFMPEG_BIN_DIR}/*.dll")
+    if(FFMPEG_RUNTIME_DLLS)
+        install(FILES ${FFMPEG_RUNTIME_DLLS}
+            DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+    endif()
+endif()
+

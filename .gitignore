@@ -1,0 +1,11 @@
+build/
+bin/
+lib/
+out/
+.vs/
+*.user
+*.suo
+*.vcxproj.user
+src/**/build_tmp/
+
+CMakeSettings.json
