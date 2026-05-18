@@ -1,14 +1,13 @@
-// Copyright (c) 2026 yasukioo
-// Author: yasukioo <yasukioo@outlook.com>
-
 #include "FFmpegViewItem.h"
 #include "FFmpegPlayer.h"
+#include "PlaybackTracer.h"
 
 #include <QImage>
 #include <QMutexLocker>
 #include <QPainter>
 #include <QQuickWindow>
 #include <QSGSimpleTextureNode>
+#include <QTimer>
 
 FFmpegViewItem::FFmpegViewItem(QQuickItem* parent)
     : QQuickItem(parent)
@@ -16,7 +15,6 @@ FFmpegViewItem::FFmpegViewItem(QQuickItem* parent)
     setFlag(QQuickItem::ItemHasContents, true);
 
     updateRenderInterval();
-    limiter_.start();
     player_ = new FFmpegPlayer();
     applyPlayerConfig();
 
@@ -35,37 +33,16 @@ FFmpegViewItem::FFmpegViewItem(QQuickItem* parent)
 
 FFmpegViewItem::~FFmpegViewItem()
 {
-    shutdownPlayer();
-}
-
-void FFmpegViewItem::releaseResources()
-{
-    {
-        QMutexLocker locker(&frameMutex_);
-        currentFrame_ = QImage();
+    if (player_) {
+        QObject::disconnect(player_, nullptr, this, nullptr);
+        player_->stop();
+        {
+            QMutexLocker locker(&frameMutex_);
+            currentFrame_ = QImage();
+        }
+        player_->deleteLater();
+        player_ = nullptr;
     }
-    QQuickItem::releaseResources();
-}
-
-void FFmpegViewItem::shutdownPlayer()
-{
-    if (shuttingDown_) {
-        return;
-    }
-    shuttingDown_ = true;
-
-    if (!player_) {
-        return;
-    }
-
-    QObject::disconnect(player_, nullptr, this, nullptr);
-    player_->stop();
-    {
-        QMutexLocker locker(&frameMutex_);
-        currentFrame_ = QImage();
-    }
-    delete player_;
-    player_ = nullptr;
 }
 
 void FFmpegViewItem::applyPlayerConfig()
@@ -84,6 +61,10 @@ void FFmpegViewItem::applyPlayerConfig()
     player_->setTransientReadErrorLimit(transientReadErrorLimit_);
     player_->setTransientDecodeErrorLimit(transientDecodeErrorLimit_);
     player_->setDecodeThreadCount(decodeThreadCount_);
+    player_->setUseNoBuffer(useNoBuffer_);
+    player_->setUseLowDelay(useLowDelay_);
+    player_->setDisableReorderQueue(disableReorderQueue_);
+    player_->setSkipNonRefFrames(skipNonRefFrames_);
 }
 
 void FFmpegViewItem::updateRenderInterval()
@@ -93,10 +74,6 @@ void FFmpegViewItem::updateRenderInterval()
 
 void FFmpegViewItem::restartPlayback()
 {
-    if (shuttingDown_) {
-        return;
-    }
-
     updateRenderInterval();
 
     {
@@ -118,8 +95,7 @@ void FFmpegViewItem::restartPlayback()
 
 QSGNode* FFmpegViewItem::updatePaintNode(QSGNode* previous, QQuickItem::UpdatePaintNodeData*)
 {
-    if (shuttingDown_ || !window()) {
-        delete previous;
+    if (!window()) {
         return nullptr;
     }
 
@@ -132,6 +108,10 @@ QSGNode* FFmpegViewItem::updatePaintNode(QSGNode* previous, QQuickItem::UpdatePa
     if (frame.isNull()) {
         delete previous;
         return createTextNode();
+    }
+
+    if (player_) {
+        PlaybackTracer::instance().mark(player_->tracerId(), "PAINT");
     }
 
     auto node = static_cast<QSGSimpleTextureNode*>(previous);
@@ -174,28 +154,48 @@ QSGNode* FFmpegViewItem::createTextNode()
 
 void FFmpegViewItem::onFrameReady()
 {
-    if (shuttingDown_ || player_ == nullptr) {
+    if (player_ == nullptr) {
         return;
     }
 
-    const QImage frame = player_->takeLatestFrame();
+    const qint64 emitMs = player_->lastEmitMonoMs();
+    if (emitMs > 0) {
+        const qint64 delay = PlaybackTracer::monoMs() - emitMs;
+        if (delay >= 100) {
+            PlaybackTracer::instance().event(player_->tracerId(), "DISPATCH_SLOW",
+                QStringLiteral("emit_to_take=%1ms").arg(delay));
+        }
+    }
+
+    consumeNextFrame();
+}
+
+void FFmpegViewItem::consumeNextFrame()
+{
+    if (player_ == nullptr) {
+        return;
+    }
+
+    bool more = false;
+    QImage frame = player_->takeNextFrame(more);
     if (frame.isNull()) {
         return;
     }
 
-    if (limiter_.elapsed() < targetFrameIntervalMs_) {
-        return;
-    }
-
-    limiter_.restart();
+    PlaybackTracer::instance().mark(player_->tracerId(), "FRAMEREADY");
 
     {
         QMutexLocker locker(&frameMutex_);
-        currentFrame_ = frame;
+        currentFrame_ = std::move(frame);
     }
 
     state_ = PlayState::Playing;
     update();
+
+    if (more) {
+        // 队列里还有积压帧，按目标帧率间隔均匀出帧，把网络/UI 抖动平滑掉。
+        QTimer::singleShot(targetFrameIntervalMs_, this, &FFmpegViewItem::consumeNextFrame);
+    }
 }
 
 void FFmpegViewItem::setUrl(const QString& url)
@@ -204,7 +204,7 @@ void FFmpegViewItem::setUrl(const QString& url)
         url_ = url;
         emit urlChanged();
 
-        if (!shuttingDown_ && player_) {
+        if (player_) {
             player_->stop();
             player_->setUrl(url);
             if (!url.isEmpty()) {
@@ -300,9 +300,41 @@ void FFmpegViewItem::setTransientDecodeErrorLimit(int value)
 
 void FFmpegViewItem::setDecodeThreadCount(int value)
 {
-    value = std::max(value, 1);
+    value = std::max(value, 0);
     if (decodeThreadCount_ == value) return;
     decodeThreadCount_ = value;
+    emit configChanged();
+    restartPlayback();
+}
+
+void FFmpegViewItem::setUseNoBuffer(bool value)
+{
+    if (useNoBuffer_ == value) return;
+    useNoBuffer_ = value;
+    emit configChanged();
+    restartPlayback();
+}
+
+void FFmpegViewItem::setUseLowDelay(bool value)
+{
+    if (useLowDelay_ == value) return;
+    useLowDelay_ = value;
+    emit configChanged();
+    restartPlayback();
+}
+
+void FFmpegViewItem::setDisableReorderQueue(bool value)
+{
+    if (disableReorderQueue_ == value) return;
+    disableReorderQueue_ = value;
+    emit configChanged();
+    restartPlayback();
+}
+
+void FFmpegViewItem::setSkipNonRefFrames(bool value)
+{
+    if (skipNonRefFrames_ == value) return;
+    skipNonRefFrames_ = value;
     emit configChanged();
     restartPlayback();
 }
@@ -318,10 +350,6 @@ void FFmpegViewItem::setRenderFps(int value)
 
 void FFmpegViewItem::onErrorOccurred(const QString& error)
 {
-    if (shuttingDown_) {
-        return;
-    }
-
     errorMessage_ = error;
     state_ = PlayState::Failed;
     update();
@@ -329,10 +357,6 @@ void FFmpegViewItem::onErrorOccurred(const QString& error)
 
 void FFmpegViewItem::onConnectedChanged(bool connected)
 {
-    if (shuttingDown_) {
-        return;
-    }
-
     if (connected) {
         if (state_ == PlayState::Failed) {
             errorMessage_.clear();

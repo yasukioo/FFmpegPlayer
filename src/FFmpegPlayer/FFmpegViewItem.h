@@ -1,9 +1,5 @@
-// Copyright (c) 2026 yasukioo
-// Author: yasukioo <yasukioo@outlook.com>
-
 #pragma once
 
-#include <QElapsedTimer>
 #include <QImage>
 #include <QMutex>
 #include <QQuickItem>
@@ -26,6 +22,10 @@ class FFmpegViewItem : public QQuickItem
     Q_PROPERTY(int transientReadErrorLimit READ transientReadErrorLimit WRITE setTransientReadErrorLimit NOTIFY configChanged)
     Q_PROPERTY(int transientDecodeErrorLimit READ transientDecodeErrorLimit WRITE setTransientDecodeErrorLimit NOTIFY configChanged)
     Q_PROPERTY(int decodeThreadCount READ decodeThreadCount WRITE setDecodeThreadCount NOTIFY configChanged)
+    Q_PROPERTY(bool useNoBuffer READ useNoBuffer WRITE setUseNoBuffer NOTIFY configChanged)
+    Q_PROPERTY(bool useLowDelay READ useLowDelay WRITE setUseLowDelay NOTIFY configChanged)
+    Q_PROPERTY(bool disableReorderQueue READ disableReorderQueue WRITE setDisableReorderQueue NOTIFY configChanged)
+    Q_PROPERTY(bool skipNonRefFrames READ skipNonRefFrames WRITE setSkipNonRefFrames NOTIFY configChanged)
     Q_PROPERTY(int renderFps READ renderFps WRITE setRenderFps NOTIFY configChanged)
     QML_ELEMENT
 
@@ -34,7 +34,6 @@ public:
     ~FFmpegViewItem();
 
     QSGNode* updatePaintNode(QSGNode*, UpdatePaintNodeData*) override;
-    void releaseResources() override;
 
     QString url() const { return url_; }
     void setUrl(const QString& url);
@@ -58,6 +57,14 @@ public:
     void setTransientDecodeErrorLimit(int value);
     int decodeThreadCount() const { return decodeThreadCount_; }
     void setDecodeThreadCount(int value);
+    bool useNoBuffer() const { return useNoBuffer_; }
+    void setUseNoBuffer(bool value);
+    bool useLowDelay() const { return useLowDelay_; }
+    void setUseLowDelay(bool value);
+    bool disableReorderQueue() const { return disableReorderQueue_; }
+    void setDisableReorderQueue(bool value);
+    bool skipNonRefFrames() const { return skipNonRefFrames_; }
+    void setSkipNonRefFrames(bool value);
     int renderFps() const { return renderFps_; }
     void setRenderFps(int value);
 
@@ -75,7 +82,7 @@ private:
     void applyPlayerConfig();
     void updateRenderInterval();
     void restartPlayback();
-    void shutdownPlayer();
+    void consumeNextFrame();
 
     enum class PlayState {
         Loading,
@@ -89,7 +96,6 @@ private:
     QImage currentFrame_;
     QMutex frameMutex_;
 
-    QElapsedTimer limiter_;
     FFmpegPlayer* player_ = nullptr;
     QString url_;
     int targetFrameIntervalMs_ = 33;
@@ -102,7 +108,10 @@ private:
     int reconnectPauseMs_ = 150;
     int transientReadErrorLimit_ = 5;
     int transientDecodeErrorLimit_ = 20;
-    int decodeThreadCount_ = 1;
+    int decodeThreadCount_ = 0;
+    bool useNoBuffer_ = true;
+    bool useLowDelay_ = true;
+    bool disableReorderQueue_ = true;
+    bool skipNonRefFrames_ = false;
     int renderFps_ = 30;
-    bool shuttingDown_ = false;
 };

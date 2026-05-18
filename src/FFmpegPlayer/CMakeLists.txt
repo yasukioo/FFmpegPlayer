@@ -15,6 +15,8 @@ qt_add_qml_module(${PROJECT_NAME}
         FFmpegPlayer.cpp
         FFmpegViewItem.h
         FFmpegViewItem.cpp
+        PlaybackTracer.h
+        PlaybackTracer.cpp
 )
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

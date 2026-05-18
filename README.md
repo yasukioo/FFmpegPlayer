@@ -24,7 +24,7 @@
 - `src/FFmpegPlayer/`：核心库源码
 
 ## QML 用法
-ssss
+
 ```qml
 import FFmpegPlayer 1.0
 

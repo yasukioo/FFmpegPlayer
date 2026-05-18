@@ -1,10 +1,10 @@
-// Copyright (c) 2026 yasukioo
-// Author: yasukioo <yasukioo@outlook.com>
-
 #include "FFmpegPlayer.h"
+#include "PlaybackTracer.h"
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QMutexLocker>
+#include <atomic>
 
 namespace
 {
@@ -14,6 +14,8 @@ QString ffmpegErrorString(int errorCode)
     av_strerror(errorCode, buffer, sizeof(buffer));
     return QString::fromUtf8(buffer);
 }
+
+std::atomic_int g_nextPlayerId{1};
 }
 
 std::shared_ptr<FFmpegPlayer::FrameBufferPool> FFmpegPlayer::FrameBufferPool::create()
@@ -76,7 +78,12 @@ FFmpegPlayer::FFmpegPlayer(QObject* parent)
 {
     avformat_network_init();
 
-    connect(thread_, &QThread::started, this, &FFmpegPlayer::run, Qt::DirectConnection);
+    tracerId_ = QStringLiteral("P%1").arg(g_nextPlayerId.fetch_add(1, std::memory_order_relaxed));
+    PlaybackTracer::instance().start(
+        QCoreApplication::applicationDirPath() + QStringLiteral("/logs"), 300);
+
+    moveToThread(thread_);
+    connect(thread_, &QThread::started, this, &FFmpegPlayer::run);
 }
 
 FFmpegPlayer::~FFmpegPlayer()
@@ -141,8 +148,31 @@ void FFmpegPlayer::setDecodeThreadCount(int value)
     config_.decodeThreadCount = std::max(value, 0);
 }
 
+void FFmpegPlayer::setUseNoBuffer(bool value)
+{
+    config_.useNoBuffer = value;
+}
+
+void FFmpegPlayer::setUseLowDelay(bool value)
+{
+    config_.useLowDelay = value;
+}
+
+void FFmpegPlayer::setDisableReorderQueue(bool value)
+{
+    config_.disableReorderQueue = value;
+}
+
+void FFmpegPlayer::setSkipNonRefFrames(bool value)
+{
+    config_.skipNonRefFrames = value;
+}
+
 void FFmpegPlayer::requestKeyFrame()
 {
+    if (!awaitingKeyFrame_) {
+        PlaybackTracer::instance().event(tracerId_, "KEYWAIT", QStringLiteral("flushing decoder, awaiting next I-frame"));
+    }
     awaitingKeyFrame_ = true;
     if (codec_ctx_ != nullptr) {
         avcodec_flush_buffers(codec_ctx_);
@@ -180,13 +210,26 @@ void FFmpegPlayer::stop()
         thread_->quit();
         thread_->wait();
     }
+    QMutexLocker locker(&frameMutex_);
+    frameQueue_.clear();
+    frameNotificationPending_ = false;
 }
 
-QImage FFmpegPlayer::takeLatestFrame()
+QImage FFmpegPlayer::takeNextFrame(bool& moreAvailable)
 {
     QMutexLocker locker(&frameMutex_);
-    frameNotificationPending_ = false;
-    return latestFrame_;
+    if (frameQueue_.empty()) {
+        moreAvailable = false;
+        frameNotificationPending_ = false;
+        return QImage();
+    }
+    QImage frame = std::move(frameQueue_.front());
+    frameQueue_.pop_front();
+    moreAvailable = !frameQueue_.empty();
+    // 队列非空时保持 pending=true，由 UI 端通过定时器继续消费；
+    // 队列为空时复位，下一帧到达由解码线程重新触发 frameReady。
+    frameNotificationPending_ = moreAvailable;
+    return frame;
 }
 
 void FFmpegPlayer::sleepInterruptible(int ms)
@@ -222,11 +265,17 @@ bool FFmpegPlayer::openStream(int& videoStream)
     av_dict_set(&opts, "rtsp_transport", config_.rtspTransport.toUtf8().constData(), 0);
     av_dict_set(&opts, "timeout", QByteArray::number(config_.timeoutUs).constData(), 0);
     av_dict_set(&opts, "stimeout", QByteArray::number(config_.timeoutUs).constData(), 0);
-    av_dict_set(&opts, "fflags", "nobuffer", 0);
-    av_dict_set(&opts, "flags", "low_delay", 0);
     av_dict_set(&opts, "buffer_size", QByteArray::number(config_.socketBufferSize).constData(), 0);
     av_dict_set(&opts, "max_delay", QByteArray::number(config_.maxDelayUs).constData(), 0);
-    av_dict_set(&opts, "reorder_queue_size", "0", 0);
+    if (config_.useNoBuffer) {
+        av_dict_set(&opts, "fflags", "nobuffer", 0);
+    }
+    if (config_.useLowDelay) {
+        av_dict_set(&opts, "flags", "low_delay", 0);
+    }
+    if (config_.disableReorderQueue) {
+        av_dict_set(&opts, "reorder_queue_size", "0", 0);
+    }
 
     const QByteArray urlBytes = rtsp_url_.toUtf8();
     const int openRet = avformat_open_input(&fmt_ctx_, urlBytes.constData(), nullptr, &opts);
@@ -238,10 +287,12 @@ bool FFmpegPlayer::openStream(int& videoStream)
         return false;
     }
 
-    fmt_ctx_->flags |= AVFMT_FLAG_NOBUFFER;
+    if (config_.useNoBuffer) {
+        fmt_ctx_->flags |= AVFMT_FLAG_NOBUFFER;
+    }
     fmt_ctx_->probesize = config_.probeSize;
     fmt_ctx_->max_analyze_duration = config_.analyzeDurationUs;
-    fmt_ctx_->max_delay = 0;
+    fmt_ctx_->max_delay = config_.maxDelayUs;
 
     const int infoRet = avformat_find_stream_info(fmt_ctx_, nullptr);
     if (infoRet < 0) {
@@ -281,8 +332,13 @@ bool FFmpegPlayer::openStream(int& videoStream)
     codec_ctx_->thread_count = config_.decodeThreadCount;
     codec_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     codec_ctx_->err_recognition |= AV_EF_CRCCHECK | AV_EF_BITSTREAM | AV_EF_BUFFER;
+    if (config_.skipNonRefFrames) {
+        codec_ctx_->skip_frame = AVDISCARD_NONREF;
+    }
 #ifdef AV_CODEC_FLAG_LOW_DELAY
-    codec_ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    if (config_.useLowDelay) {
+        codec_ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    }
 #endif
 #ifdef AV_CODEC_FLAG2_FAST
     codec_ctx_->flags2 |= AV_CODEC_FLAG2_FAST;
@@ -313,27 +369,44 @@ bool FFmpegPlayer::openStream(int& videoStream)
 void FFmpegPlayer::queueFrame(QImage&& frame)
 {
     bool shouldNotify = false;
+    int droppedOldest = 0;
+    int queueDepth = 0;
     {
         QMutexLocker locker(&frameMutex_);
-        latestFrame_ = std::move(frame);
+        frameQueue_.push_back(std::move(frame));
+        while (frameQueue_.size() > static_cast<size_t>(kMaxQueueDepth)) {
+            frameQueue_.pop_front();
+            ++droppedOldest;
+        }
+        queueDepth = static_cast<int>(frameQueue_.size());
         if (!frameNotificationPending_) {
             frameNotificationPending_ = true;
             shouldNotify = true;
         }
     }
 
+    PlaybackTracer::instance().mark(tracerId_, "QUEUE",
+        droppedOldest > 0
+            ? QStringLiteral("depth=%1 dropped_oldest=%2").arg(queueDepth).arg(droppedOldest)
+            : QStringLiteral("depth=%1").arg(queueDepth));
+
     if (shouldNotify) {
+        lastEmitMonoMs_.store(PlaybackTracer::monoMs(), std::memory_order_release);
         emit frameReady();
     }
 }
 
 void FFmpegPlayer::run()
 {
+    auto& tracer = PlaybackTracer::instance();
+
     while (running_) {
         emit connectedChanged(false);
+        tracer.event(tracerId_, "OPEN", QStringLiteral("url=%1 transport=%2").arg(rtsp_url_, config_.rtspTransport));
 
         int videoStream = -1;
         if (!openStream(videoStream)) {
+            tracer.event(tracerId_, "OPEN_FAIL", QStringLiteral("retry in %1 ms").arg(config_.reconnectPauseMs));
             if (running_) {
                 sleepInterruptible(config_.reconnectPauseMs);
             }
@@ -342,6 +415,31 @@ void FFmpegPlayer::run()
 
         emit connectedChanged(true);
         awaitingKeyFrame_ = true;
+        tracer.event(tracerId_, "OPEN_OK",
+            QStringLiteral("video_stream=%1 codec=%2 size=%3x%4")
+                .arg(videoStream)
+                .arg(codec_ ? QString::fromUtf8(codec_->name) : QStringLiteral("?"))
+                .arg(codec_ctx_ ? codec_ctx_->width : 0)
+                .arg(codec_ctx_ ? codec_ctx_->height : 0));
+
+        tracer.event(tracerId_, "CONFIG",
+            QStringLiteral("transport=%1 timeout=%2us sockBuf=%3 maxDelay=%4us probe=%5 "
+                           "analyze=%6us reconnPause=%7ms readErrLim=%8 decErrLim=%9 "
+                           "threads=%10 noBuf=%11 lowDelay=%12 noReorder=%13 skipNonRef=%14")
+                .arg(config_.rtspTransport)
+                .arg(config_.timeoutUs)
+                .arg(config_.socketBufferSize)
+                .arg(config_.maxDelayUs)
+                .arg(config_.probeSize)
+                .arg(config_.analyzeDurationUs)
+                .arg(config_.reconnectPauseMs)
+                .arg(config_.transientReadErrorLimit)
+                .arg(config_.transientDecodeErrorLimit)
+                .arg(config_.decodeThreadCount)
+                .arg(config_.useNoBuffer)
+                .arg(config_.useLowDelay)
+                .arg(config_.disableReorderQueue)
+                .arg(config_.skipNonRefFrames));
 
         int consecutiveReadErrors = 0;
         int consecutiveDecodeErrors = 0;
@@ -359,12 +457,19 @@ void FFmpegPlayer::run()
                 }
 
                 ++consecutiveReadErrors;
+                tracer.event(tracerId_, "READ_ERR",
+                    QStringLiteral("ret=%1 (%2) seq=%3/%4")
+                        .arg(readRet)
+                        .arg(ffmpegErrorString(readRet))
+                        .arg(consecutiveReadErrors)
+                        .arg(config_.transientReadErrorLimit));
                 if (consecutiveReadErrors < config_.transientReadErrorLimit) {
                     sleepInterruptible(config_.reconnectPauseMs);
                     continue;
                 }
 
                 emit errorOccurred(QStringLiteral("读取码流失败，准备重连: %1").arg(ffmpegErrorString(readRet)));
+                tracer.event(tracerId_, "RECONNECT", QStringLiteral("reason=read_errors"));
                 needReconnect = true;
                 break;
             }
@@ -376,6 +481,12 @@ void FFmpegPlayer::run()
                 continue;
             }
 
+            tracer.mark(tracerId_, "READ",
+                QStringLiteral("size=%1 pts=%2 flags=0x%3")
+                    .arg(packet_->size)
+                    .arg(packet_->pts)
+                    .arg(packet_->flags, 0, 16));
+
             const int sendRet = avcodec_send_packet(codec_ctx_, packet_);
             if (sendRet == AVERROR(EAGAIN)) {
                 av_packet_unref(packet_);
@@ -384,11 +495,18 @@ void FFmpegPlayer::run()
 
             if (sendRet < 0 && sendRet != AVERROR_EOF) {
                 ++consecutiveDecodeErrors;
+                tracer.event(tracerId_, "SEND_ERR",
+                    QStringLiteral("ret=%1 (%2) seq=%3/%4")
+                        .arg(sendRet)
+                        .arg(ffmpegErrorString(sendRet))
+                        .arg(consecutiveDecodeErrors)
+                        .arg(config_.transientDecodeErrorLimit));
                 qDebug() << "Drop corrupt packet:" << sendRet;
                 av_packet_unref(packet_);
                 requestKeyFrame();
                 if (consecutiveDecodeErrors >= config_.transientDecodeErrorLimit) {
                     emit errorOccurred(QStringLiteral("连续解码失败，准备重连: %1").arg(ffmpegErrorString(sendRet)));
+                    tracer.event(tracerId_, "RECONNECT", QStringLiteral("reason=send_errors"));
                     needReconnect = true;
                 }
                 continue;
@@ -402,10 +520,17 @@ void FFmpegPlayer::run()
 
                 if (receiveRet < 0) {
                     ++consecutiveDecodeErrors;
+                    tracer.event(tracerId_, "RECV_ERR",
+                        QStringLiteral("ret=%1 (%2) seq=%3/%4")
+                            .arg(receiveRet)
+                            .arg(ffmpegErrorString(receiveRet))
+                            .arg(consecutiveDecodeErrors)
+                            .arg(config_.transientDecodeErrorLimit));
                     qDebug() << "Receive frame error:" << receiveRet;
                     requestKeyFrame();
                     if (consecutiveDecodeErrors >= config_.transientDecodeErrorLimit) {
                         emit errorOccurred(QStringLiteral("连续解码失败，准备重连: %1").arg(ffmpegErrorString(receiveRet)));
+                        tracer.event(tracerId_, "RECONNECT", QStringLiteral("reason=recv_errors"));
                         needReconnect = true;
                     }
                     break;
@@ -414,6 +539,10 @@ void FFmpegPlayer::run()
                 consecutiveDecodeErrors = 0;
 
                 if (isFrameCorrupt(frame_)) {
+                    tracer.event(tracerId_, "CORRUPT",
+                        QStringLiteral("decode_error_flags=0x%1 flags=0x%2")
+                            .arg(frame_->decode_error_flags, 0, 16)
+                            .arg(frame_->flags, 0, 16));
                     qDebug() << "Drop corrupt frame, error_flags=" << frame_->decode_error_flags;
                     requestKeyFrame();
                     av_frame_unref(frame_);
@@ -430,7 +559,11 @@ void FFmpegPlayer::run()
                         continue;
                     }
                     awaitingKeyFrame_ = false;
+                    tracer.event(tracerId_, "KEYRESUME", QStringLiteral("got I-frame, resuming output"));
                 }
+
+                tracer.mark(tracerId_, "DECODE",
+                    QStringLiteral("pict_type=%1 pts=%2").arg(QChar(av_get_picture_type_char(frame_->pict_type))).arg(frame_->pts));
 
                 const int width = codec_ctx_->width;
                 const int height = codec_ctx_->height;
@@ -452,6 +585,8 @@ void FFmpegPlayer::run()
         }
 
         cleanupResources();
+        tracer.event(tracerId_, "CLOSED",
+            needReconnect ? QStringLiteral("will reconnect") : QStringLiteral("stop requested"));
 
         if (running_) {
             sleepInterruptible(config_.reconnectPauseMs);

@@ -1,6 +1,3 @@
-// Copyright (c) 2026 yasukioo
-// Author: yasukioo <yasukioo@outlook.com>
-
 #pragma once
 
 #include <QObject>
@@ -9,6 +6,7 @@
 #include <QString>
 #include <QThread>
 #include <atomic>
+#include <deque>
 #include <memory>
 #include <vector>
 
@@ -37,9 +35,15 @@ public:
     void setTransientReadErrorLimit(int value);
     void setTransientDecodeErrorLimit(int value);
     void setDecodeThreadCount(int value);
+    void setUseNoBuffer(bool value);
+    void setUseLowDelay(bool value);
+    void setDisableReorderQueue(bool value);
+    void setSkipNonRefFrames(bool value);
     void start();
     void stop();
-    QImage takeLatestFrame();
+    QImage takeNextFrame(bool& moreAvailable);
+    QString tracerId() const { return tracerId_; }
+    qint64 lastEmitMonoMs() const { return lastEmitMonoMs_.load(std::memory_order_acquire); }
 
 signals:
     void frameReady();
@@ -79,6 +83,10 @@ private:
         int transientReadErrorLimit = 5;
         int transientDecodeErrorLimit = 20;
         int decodeThreadCount = 0;
+        bool useNoBuffer = true;
+        bool useLowDelay = true;
+        bool disableReorderQueue = true;
+        bool skipNonRefFrames = false;
     };
 
     void run();
@@ -92,6 +100,7 @@ private:
     bool isFrameCorrupt(const AVFrame* f) const;
 
     QString rtsp_url_;
+    QString tracerId_;
 
     QThread* thread_;
     std::atomic_bool running_;
@@ -103,8 +112,11 @@ private:
     AVFrame* frame_;
     SwsContext* sws_ctx_;
 
+    static constexpr int kMaxQueueDepth = 3;
+
     QMutex frameMutex_;
-    QImage latestFrame_;
+    std::deque<QImage> frameQueue_;
+    std::atomic<qint64> lastEmitMonoMs_{0};
     bool frameNotificationPending_ = false;
     bool awaitingKeyFrame_ = true;
     RuntimeConfig config_;
