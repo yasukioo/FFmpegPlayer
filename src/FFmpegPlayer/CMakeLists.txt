@@ -1,3 +1,6 @@
+# Copyright (c) 2026 yasukioo
+# Author: yasukioo <yasukioo@outlook.com>
+
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(QT_QML_OUTPUT_DIRECTORY  ${CMAKE_BINARY_DIR})

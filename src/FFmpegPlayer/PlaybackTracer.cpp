@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yasukioo
+// Author: yasukioo <yasukioo@outlook.com>
+
 #include "PlaybackTracer.h"
 
 #include <QDateTime>

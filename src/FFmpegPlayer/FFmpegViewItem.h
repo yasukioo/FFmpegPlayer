@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yasukioo
+// Author: yasukioo <yasukioo@outlook.com>
+
 #pragma once
 
 #include <QImage>

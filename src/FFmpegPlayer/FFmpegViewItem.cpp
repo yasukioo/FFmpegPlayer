@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yasukioo
+// Author: yasukioo <yasukioo@outlook.com>
+ 
 #include "FFmpegViewItem.h"
 #include "FFmpegPlayer.h"
 #include "PlaybackTracer.h"
