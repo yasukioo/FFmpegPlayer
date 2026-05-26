@@ -3,6 +3,26 @@
 
 #pragma once
 
+/**
+ * Recommended configuration for weak or unstable network conditions:
+ *
+ * rtspTransport=tcp
+ * timeoutUs=1500000
+ * bufferSize=2097152
+ * maxDelayUs=300000
+ * probeSize=1048576
+ * analyzeDurationUs=500000
+ * reconnectPauseMs=200
+ * transientReadErrorLimit=3
+ * transientDecodeErrorLimit=12
+ * decodeThreadCount=0
+ * renderFps=30
+ * useNoBuffer=true
+ * useLowDelay=true
+ * disableReorderQueue=true
+ * skipNonRefFrames=false
+ */
+
 #include <QObject>
 #include <QImage>
 #include <QMutex>
